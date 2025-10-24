@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os, json
 from mcp.server.fastmcp import FastMCP
-import retrieval_core as core
+import retreival_core as core
 
 # Safety for transformers
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
