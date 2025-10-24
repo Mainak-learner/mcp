@@ -8,8 +8,7 @@ import retrieval_core as core
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-mcp = FastMCP("PDF-QA-RAG", version="1.0.0", description="Index PDFs and retrieve per-document context for QA")
-
+mcp = FastMCP("PDF-QA-RAG") 
 @mcp.tool()
 def index_pdfs(paths: list[str], chunk_chars: int = 1200, overlap: int = 150) -> str:
     """Index one or more PDFs or directories of PDFs."""
