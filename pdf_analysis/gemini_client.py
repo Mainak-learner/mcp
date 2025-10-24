@@ -45,7 +45,7 @@ def main():
     if not ctx["context_md"].strip():
         print("No context under budget. Increase --max_ctx_chars.", file=sys.stderr); sys.exit(1)
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("AIzaSyCTnv7TT6uQB_IYrJOeJkruIkHEFjuiK7A")
     if not api_key:
         raise RuntimeError("Set GOOGLE_API_KEY")
 
