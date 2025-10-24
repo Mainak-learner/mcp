@@ -1,7 +1,7 @@
 # gemini_client.py
 import os, sys, json, argparse
 import google.generativeai as genai
-import retrieval_core as core  # reuse the same retrieval locally
+import retreival_core as core  # reuse the same retrieval locally
 
 PROMPT = """You are a precise assistant. Use ONLY the provided snippets for each document.
 For EACH document, write concise bullet points answering the user's question.
