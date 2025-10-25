@@ -36,6 +36,7 @@ SAFETY_NONE = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HATE_SPEECH:       HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HARASSMENT:        HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUAL_CONTENT:    HarmBlockThreshold.BLOCK_NONE,
 }
 
 # ---------- Time helpers ----------
@@ -113,7 +114,7 @@ def _summarize_debug(resp) -> str:
 
 # ---------- Call Gemini robustly ----------
 def _try_generate(model, prompt: str, force_json: bool, debug: bool):
-    cfg = {"max_output_tokens": 512}
+    cfg = {"max_output_tokens": 1024}  # Increased from 512
     if force_json:
         cfg["response_mime_type"] = "application/json"
 
