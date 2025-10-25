@@ -139,7 +139,7 @@ def create_meet_event(
         calendarId=calendar_id,
         body=body,
         conferenceDataVersion=1,
-        sendUpdates=send_updates
+        sendUpdates='all'
     ).execute()
 
     meet_link = None
