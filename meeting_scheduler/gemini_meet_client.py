@@ -4,11 +4,11 @@ from datetime import datetime, timedelta
 
 import google.generativeai as genai
 import google.api_core.exceptions as gexc
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-import scheduler_core as core  # reuse the same engine locally
+import scheduler_core as core
 import pytz
 
-# ---------------- Instructions sent to Gemini ----------------
 INSTRUCTIONS = """You are an assistant that extracts meeting details as JSON.
 
 Return ONLY a JSON object:
@@ -31,7 +31,15 @@ Rules:
 - Output JSON ONLY (no backticks, no extra text).
 """
 
-# ---------------- Time helpers ----------------
+# ---------- Safety: allow benign scheduling content ----------
+SAFETY_NONE = {
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH:       HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HARASSMENT:        HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUAL_CONTENT:    HarmBlockThreshold.BLOCK_NONE,
+}
+
+# ---------- Time helpers ----------
 def _tz(tzname: str):
     try:
         return pytz.timezone(tzname)
@@ -39,10 +47,8 @@ def _tz(tzname: str):
         return pytz.timezone("America/Chicago")
 
 def _coerce_future_start(start_iso: str, tzname: str) -> datetime:
-    """Ensure the returned start is in the future; if past, roll forward by weeks until future."""
     tzinfo = _tz(tzname)
     now = datetime.now(tzinfo)
-    # robust parse (handles trailing Z)
     dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = tzinfo.localize(dt)
@@ -51,7 +57,7 @@ def _coerce_future_start(start_iso: str, tzname: str) -> datetime:
         dt = dt + timedelta(weeks=1)
     return dt
 
-# ---------------- Response text helpers ----------------
+# ---------- Response helpers ----------
 def _strip_code_fence(s: str) -> str:
     s = s.strip()
     if s.startswith("```"):
@@ -63,7 +69,6 @@ def _strip_code_fence(s: str) -> str:
     return s.strip()
 
 def _extract_text(resp) -> str:
-    """Safely concatenate text from candidates/parts; return '' if none."""
     for cand in getattr(resp, "candidates", []) or []:
         content = getattr(cand, "content", None)
         if not content:
@@ -80,75 +85,105 @@ def _extract_text(resp) -> str:
             return "\n".join(out).strip()
     return ""
 
-def _gen_json_or_retry(model, prompt: str) -> str:
-    """
-    Ask for JSON; if the model returns no parts (blocked/empty), retry without forcing JSON.
-    If still empty, raise with finish_reason and prompt_feedback for debugging.
-    """
-    # First try: force JSON MIME for raw object
+def _summarize_debug(resp) -> str:
     try:
-        resp = model.generate_content(
-            prompt,
-            generation_config={
-                "response_mime_type": "application/json",
-                "max_output_tokens": 512,
-            },
-        )
-    except gexc.ResourceExhausted:
-        # Quota: try a cheaper model automatically
-        fb_model = genai.GenerativeModel("gemini-2.5-flash")
-        resp = fb_model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json", "max_output_tokens": 512},
-        )
+        cand0 = (getattr(resp, "candidates", []) or [None])[0]
+        fin = getattr(cand0, "finish_reason", None)
+        fb  = getattr(resp, "prompt_feedback", None)
+        return f"finish_reason={fin}, prompt_feedback={fb}"
+    except Exception:
+        return "no debug info"
 
+# ---------- Call Gemini robustly ----------
+def _try_generate(model, prompt: str, force_json: bool, debug: bool):
+    cfg = {"max_output_tokens": 512}
+    if force_json:
+        cfg["response_mime_type"] = "application/json"
+
+    resp = model.generate_content(
+        prompt,
+        generation_config=cfg,
+        safety_settings=SAFETY_NONE
+    )
     txt = _extract_text(resp)
-    if not txt:
-        # Retry: plain text (some models only return fenced JSON when not forced)
-        resp2 = model.generate_content(
-            prompt + "\n\nReturn ONLY raw JSON (no backticks). This is a benign scheduling task.",
-            generation_config={"max_output_tokens": 512},
-        )
-        txt = _extract_text(resp2)
+    if debug:
+        print("[DEBUG] model:", getattr(model, "model_name", "unknown"),
+              "| force_json:", force_json,
+              "| extracted_len:", len(txt),
+              "|", _summarize_debug(resp),
+              file=sys.stderr)
+    return txt, resp
+
+def _gen_json_or_retry(models, prompt: str, debug: bool) -> str:
+    """
+    Iterate over candidate models; for each, try:
+      1) forced JSON
+      2) non-forced (plain text) with an explicit reminder
+    Return stripped JSON text or raise with actionable debug.
+    """
+    last_dbg = ""
+    for m in models:
+        # 1) forced JSON
+        try:
+            txt, resp = _try_generate(m, prompt, force_json=True, debug=debug)
+        except gexc.ResourceExhausted:
+            # skip to next model if quota hit
+            if debug: print("[DEBUG] quota exhausted; trying next model", file=sys.stderr)
+            txt, resp = "", None
 
         if not txt:
-            cand0 = (getattr(resp, "candidates", []) or [None])[0]
-            fin = getattr(cand0, "finish_reason", None)
-            fb  = getattr(resp, "prompt_feedback", None)
-            raise SystemExit(f"Gemini returned no text (finish_reason={fin}, prompt_feedback={fb}).")
+            # 2) non-forced
+            txt2, resp2 = _try_generate(
+                m,
+                prompt + "\n\nReturn ONLY raw JSON (no backticks). This is a benign scheduling task.",
+                force_json=False,
+                debug=debug
+            )
+            txt = txt2
+            resp = resp2 if txt2 else resp
 
-    return _strip_code_fence(txt)
+        if txt:
+            return _strip_code_fence(txt)
 
-# ---------------- Main ----------------
+        # collect debug message
+        if resp is not None:
+            last_dbg = _summarize_debug(resp)
+
+    raise SystemExit(f"Gemini returned no text from all models. Last attempt debug: {last_dbg}")
+
+# ---------- Main ----------
 def main():
     if "GOOGLE_API_KEY" not in os.environ:
         print("Set GOOGLE_API_KEY.", file=sys.stderr)
         sys.exit(1)
 
-    # Configure SDK
     genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
 
     ap = argparse.ArgumentParser()
     ap.add_argument("request", help="Natural-language meeting request")
-    ap.add_argument("--model", default=None)
+    ap.add_argument("--model", default=None, help="Gemini model name (e.g., gemini-2.5-flash)")
+    ap.add_argument("--debug", action="store_true", help="Print debug info")
     args = ap.parse_args()
 
-    # Choose model (honor user choice; default to flash)
-    model_name = args.model or "gemini-2.5-flash"
-    model = genai.GenerativeModel(model_name)
+    # Build model list: prefer user choice, then sensible fallbacks
+    primary = args.model or "gemini-2.5-flash"
+    candidates = [primary]
+    # add fallbacks if not already first
+    for alt in ["gemini-flash-latest", "gemini-2.5-pro"]:
+        if alt not in candidates:
+            candidates.append(alt)
 
-    # Ask Gemini for structured JSON
+    models = [genai.GenerativeModel(name) for name in candidates]
+
     prompt = INSTRUCTIONS + "\n\nUser request:\n" + args.request
-    txt = _gen_json_or_retry(model, prompt)
+    txt = _gen_json_or_retry(models, prompt, debug=args.debug)
 
-    # Parse JSON (single attempt; show the raw text if malformed)
     try:
         data = json.loads(txt)
     except json.JSONDecodeError:
         print("Gemini did not return JSON:\n", txt, file=sys.stderr)
         sys.exit(1)
 
-    # Extract fields
     title = (data.get("title") or "Meeting").strip()
     attendees = list({(e or "").strip() for e in data.get("attendees", []) if (e or "").strip()})
     tzname = (data.get("timezone") or os.environ.get("LOCAL_TZ") or "America/Chicago").strip()
@@ -161,7 +196,6 @@ def main():
     end_iso   = data.get("end")
     window    = data.get("window") or {}
 
-    # If user gave a window + duration but no explicit start, pick earliest in window
     if (not start_iso) and window.get("start") and window.get("end") and duration:
         start_iso = window["start"]
 
@@ -169,10 +203,8 @@ def main():
         print("No start time parsed (need a time or a window).", file=sys.stderr)
         sys.exit(1)
 
-    # Enforce FUTURE start (fixes wrong-year cases)
     start_dt = _coerce_future_start(start_iso, tzname)
 
-    # Compute end from duration first; else use provided end; else default 30m
     if duration:
         end_dt = start_dt + timedelta(minutes=duration)
     elif end_iso:
@@ -182,7 +214,6 @@ def main():
     else:
         end_dt = start_dt + timedelta(minutes=30)
 
-    # Create the Calendar event with a Google Meet link; email invites go out
     evt = core.create_meet_event(
         title=title,
         start=start_dt.isoformat(),
@@ -190,7 +221,7 @@ def main():
         attendees=attendees,
         description=desc,
         time_zone=tzname,
-        send_updates="all",   # ensure invite emails are sent
+        send_updates="all",  # send email invites
     )
 
     print(json.dumps(evt, indent=2))
