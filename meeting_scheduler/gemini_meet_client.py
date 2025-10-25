@@ -9,7 +9,7 @@ import pytz
 
 INSTRUCTIONS = """You are an assistant that extracts meeting details as JSON.
 
-Return ONLY a JSON object with these fields:
+Return ONLY a JSON object:
 {
   "title": "<string, default 'Meeting'>",
   "attendees": ["email1","email2", ...],
@@ -18,44 +18,34 @@ Return ONLY a JSON object with these fields:
   "timezone": "<IANA tz like America/Chicago>",
   "description": "<optional>",
   "duration_minutes": <integer, optional>,
-  "window": { "start": "<RFC3339>", "end": "<RFC3339>" }  // optional; use if user gives a range like 'between 2–5pm'
+  "window": { "start": "<RFC3339>", "end": "<RFC3339>" }  // optional range
 }
-
 Rules:
-- If the user gives a duration (e.g., '45 minutes'), set duration_minutes.
-- If both a window and a duration are given, pick the earliest feasible time inside the window and set end = start + duration.
-- If end is missing and duration_minutes is given, set end = start + duration_minutes.
+- If user says “45 minutes”, set duration_minutes = 45.
+- If a window and a duration are given, pick the earliest feasible time in the window and set end = start + duration.
+- If end is missing and duration_minutes exists, set end = start + duration_minutes.
 - Always choose datetimes in the FUTURE relative to now.
-- Use the timezone provided by the user; otherwise use America/Chicago.
-- Output JSON ONLY (no backticks, no extra text).
-"""
+- Use the user’s timezone if provided; otherwise America/Chicago.
+- Output JSON ONLY."""
+
 
 def _tz(tzname):
-    try:
-        return pytz.timezone(tzname)
-    except Exception:
-        return pytz.timezone("America/Chicago")
+    import pytz
+    try: return pytz.timezone(tzname)
+    except Exception: return pytz.timezone("America/Chicago")
 
 def _coerce_future_start(start_iso: str, tzname: str):
-    """If Gemini returned a past date (wrong year), roll forward to the next week on the same weekday/time."""
     tzinfo = _tz(tzname)
     now = datetime.now(tzinfo)
-    try:
-        dt = datetime.fromisoformat(start_iso.replace("Z","+00:00"))
-    except Exception:
-        # last resort: let dateutil handle it (but you tightened Gemini to RFC3339)
-        from dateutil import parser as dp
-        dt = dp.parse(start_iso)
+    # robust parse (handles trailing Z)
+    dt = datetime.fromisoformat(start_iso.replace("Z","+00:00"))
     if dt.tzinfo is None:
         dt = tzinfo.localize(dt)
     dt = dt.astimezone(tzinfo)
-    # If it's already in the future, keep it
-    if dt > now:
-        return dt
-    # Otherwise, bump by weeks until future
     while dt <= now:
         dt = dt + timedelta(weeks=1)
     return dt
+
 
 
 def _pick_model(requested: str | None):
@@ -82,8 +72,30 @@ def main():
     model = genai.GenerativeModel(model_name)
     
     prompt = INSTRUCTIONS + "\n\nUser request:\n" + args.request
-    resp = model.generate_content(prompt)
+    resp = model.generate_content(
+        prompt,
+        generation_config={
+            "response_mime_type": "application/json",
+            "max_output_tokens": 512,
+        }
+    )
     txt = resp.text.strip()
+
+    def _strip_code_fence(s: str) -> str:
+        s = s.strip()
+        if s.startswith("```"):
+            s = s.strip("`")
+            # drop an optional leading language tag like json\n
+            if s.lower().startswith("json"):
+                s = s[4:] if s[:4].lower() == "json" else s
+            s = s.strip()
+        if s.endswith("```"):
+            s = s[:-3].rstrip()
+        return s
+
+    txt = _strip_code_fence(txt)
+    data = json.loads(txt)  # unchanged
+
 
     # Safety: ensure it's JSON
     try:
@@ -96,26 +108,19 @@ def main():
     tzname = (data.get("timezone") or os.environ.get("LOCAL_TZ") or "America/Chicago").strip()
     desc = data.get("description") or ""
 
-    duration = None
-    if isinstance(data.get("duration_minutes"), int) and data["duration_minutes"] > 0:
-        duration = int(data["duration_minutes"])
+    duration = data.get("duration_minutes")
+    duration = int(duration) if isinstance(duration, int) and duration > 0 else None
 
     start_iso = data.get("start")
     end_iso   = data.get("end")
     window    = data.get("window") or {}
 
-    # If user gave a time window and a duration, choose earliest slot inside window.
-    if (not start_iso) and window.get("start") and window.get("end") and duration:
-        # pick the window start, then we'll enforce future & compute end
+    if (not start_iso) and window.get("start") and window.get("end"):
         start_iso = window["start"]
-
     if not start_iso:
-        raise SystemExit("No start time parsed. Provide a specific time or a time window plus duration.")
+        raise SystemExit("No start time parsed (need a time or a window).")
 
-    # Enforce FUTURE start (fixes 2024 vs 2025)
     start_dt = _coerce_future_start(start_iso, tzname)
-
-    # Compute end: duration wins; else use provided end; else default 30m
     if duration:
         end_dt = start_dt + timedelta(minutes=duration)
     elif end_iso:
@@ -125,7 +130,6 @@ def main():
     else:
         end_dt = start_dt + timedelta(minutes=30)
 
-    # Call scheduler (ensure attendees get emails)
     evt = core.create_meet_event(
         title=title,
         start=start_dt.isoformat(),
@@ -133,10 +137,9 @@ def main():
         attendees=attendees,
         description=desc,
         time_zone=tzname,
-        send_updates="all"  # ensure notifications are sent
+        send_updates="all"   # ensure invite emails go out
     )
     print(json.dumps(evt, indent=2))
-
 if __name__ == "__main__":
     if "GOOGLE_API_KEY" not in os.environ:
         print("Set GOOGLE_API_KEY.", file=sys.stderr); sys.exit(1)
