@@ -5,17 +5,17 @@ from dateutil import parser as dateparse
 import scheduler_core as core  # reuse the same engine locally
 
 INSTRUCTIONS = """You are an assistant that extracts meeting details as JSON.
-Given a user request, output ONLY a JSON object with:
+Output ONLY:
 {
-  "title": "<string, default 'Meeting'>",
+  "title": "<string>",
   "attendees": ["email1","email2", ...],
-  "start": "<ISO or natural-language time in user's locale>",
-  "end": "<ISO or natural-language time in user's locale>",
+  "start": "<RFC3339 timestamp, e.g. 2025-10-28T14:00:00-05:00>",
+  "end": "<RFC3339 timestamp, e.g. 2025-10-28T14:45:00-05:00>",
   "timezone": "<IANA tz like America/Chicago>",
-  "description": "<notes/agenda, optional>"
+  "description": "<optional>"
 }
-Assume timezone if missing: America/Chicago. If a range is given, pick the earliest feasible time in the range.
-Duration default: 30 minutes if no end given.
+If a range is given, pick the earliest feasible time in that range.
+If no end is given, set end = start + 30 minutes.
 Return JSON only, no backticks, no extra text.
 """
 
