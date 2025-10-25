@@ -35,7 +35,13 @@ def main():
     args = ap.parse_args()
 
     model_name = _pick_model(args.model)
+    # BEFORE (you probably had an auto-picker that overrode your choice)
+    # model = genai.GenerativeModel(args.model)
+
+    # AFTER (force exact model name)
+    model_name = args.model or "gemini-2.5-flash"
     model = genai.GenerativeModel(model_name)
+    
     prompt = INSTRUCTIONS + "\n\nUser request:\n" + args.request
     resp = model.generate_content(prompt)
     txt = resp.text.strip()
