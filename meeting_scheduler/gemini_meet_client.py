@@ -4,7 +4,7 @@ import google.generativeai as genai
 from dateutil import parser as dateparse
 import scheduler_core as core  # reuse the same engine locally
 from datetime import datetime
-
+import pytz
 
 INSTRUCTIONS = """You are an assistant that extracts meeting details as JSON.
 Output ONLY:
