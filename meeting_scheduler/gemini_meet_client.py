@@ -68,18 +68,36 @@ def _strip_code_fence(s: str) -> str:
     return s.strip()
 
 def _extract_text(resp) -> str:
+    # 0) Easy path: the SDK usually aggregates into .text
+    try:
+        t = getattr(resp, "text", None)
+        if t and str(t).strip():
+            return str(t).strip()
+    except Exception:
+        pass
+
+    # 1) Walk parts like you do today
     for cand in getattr(resp, "candidates", []) or []:
         content = getattr(cand, "content", None)
         if not content:
             continue
-        parts = getattr(content, "parts", None)
-        if not parts:
-            continue
+        parts = getattr(content, "parts", None) or []
         out = []
         for p in parts:
-            t = getattr(p, "text", None)
-            if t:
-                out.append(t)
+            # text part
+            tt = getattr(p, "text", None)
+            if tt:
+                out.append(tt)
+            # inline_data (e.g., JSON when response_mime_type is application/json)
+            idata = getattr(p, "inline_data", None)
+            if idata:
+                mime = getattr(idata, "mime_type", "") or ""
+                data = getattr(idata, "data", b"")
+                if "json" in mime and data:
+                    try:
+                        out.append(data.decode("utf-8"))
+                    except Exception:
+                        pass
         if out:
             return "\n".join(out).strip()
     return ""
