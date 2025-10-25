@@ -3,6 +3,8 @@ import os, sys, json, argparse
 import google.generativeai as genai
 from dateutil import parser as dateparse
 import scheduler_core as core  # reuse the same engine locally
+import datetime
+
 
 INSTRUCTIONS = """You are an assistant that extracts meeting details as JSON.
 Output ONLY:
@@ -42,7 +44,12 @@ def main():
     model_name = args.model or "gemini-2.5-flash"
     model = genai.GenerativeModel(model_name)
     
-    prompt = INSTRUCTIONS + "\n\nUser request:\n" + args.request
+    now = datetime.now(pytz.timezone(os.environ.get("LOCAL_TZ", "America/Chicago")))
+    prompt = (
+        INSTRUCTIONS + 
+        f"\n\nCurrent date/time: {now.isoformat()}" +
+        "\n\nUser request:\n" + args.request
+    )
     resp = model.generate_content(prompt)
     txt = resp.text.strip()
 
