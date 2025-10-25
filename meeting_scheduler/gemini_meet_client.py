@@ -1,13 +1,14 @@
 # gemini_meet_client.py
 import os, sys, json, argparse
-import google.generativeai as genai
-from dateutil import parser as dateparse
-import scheduler_core as core  # reuse the same engine locally
 from datetime import datetime, timedelta
+
+import google.generativeai as genai
 import google.api_core.exceptions as gexc
+
+import scheduler_core as core  # reuse the same engine locally
 import pytz
 
-
+# ---------------- Instructions sent to Gemini ----------------
 INSTRUCTIONS = """You are an assistant that extracts meeting details as JSON.
 
 Return ONLY a JSON object:
@@ -27,19 +28,22 @@ Rules:
 - If end is missing and duration_minutes exists, set end = start + duration_minutes.
 - Always choose datetimes in the FUTURE relative to now.
 - Use the user’s timezone if provided; otherwise America/Chicago.
-- Output JSON ONLY."""
+- Output JSON ONLY (no backticks, no extra text).
+"""
 
+# ---------------- Time helpers ----------------
+def _tz(tzname: str):
+    try:
+        return pytz.timezone(tzname)
+    except Exception:
+        return pytz.timezone("America/Chicago")
 
-def _tz(tzname):
-    import pytz
-    try: return pytz.timezone(tzname)
-    except Exception: return pytz.timezone("America/Chicago")
-
-def _coerce_future_start(start_iso: str, tzname: str):
+def _coerce_future_start(start_iso: str, tzname: str) -> datetime:
+    """Ensure the returned start is in the future; if past, roll forward by weeks until future."""
     tzinfo = _tz(tzname)
     now = datetime.now(tzinfo)
     # robust parse (handles trailing Z)
-    dt = datetime.fromisoformat(start_iso.replace("Z","+00:00"))
+    dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = tzinfo.localize(dt)
     dt = dt.astimezone(tzinfo)
@@ -47,123 +51,108 @@ def _coerce_future_start(start_iso: str, tzname: str):
         dt = dt + timedelta(weeks=1)
     return dt
 
-
+# ---------------- Response text helpers ----------------
 def _strip_code_fence(s: str) -> str:
     s = s.strip()
     if s.startswith("```"):
-        # remove opening fence + optional language tag (e.g., ```json)
         s = s[3:]
         if s[:4].lower() == "json":
             s = s[4:]
-        # remove up to the closing fence if present
         if "```" in s:
             s = s.split("```", 1)[0]
     return s.strip()
 
+def _extract_text(resp) -> str:
+    """Safely concatenate text from candidates/parts; return '' if none."""
+    for cand in getattr(resp, "candidates", []) or []:
+        content = getattr(cand, "content", None)
+        if not content:
+            continue
+        parts = getattr(content, "parts", None)
+        if not parts:
+            continue
+        out = []
+        for p in parts:
+            t = getattr(p, "text", None)
+            if t:
+                out.append(t)
+        if out:
+            return "\n".join(out).strip()
+    return ""
+
 def _gen_json_or_retry(model, prompt: str) -> str:
     """
-    Ask for JSON; if the model returns no parts (blocked/empty), retry with plain text.
-    If still empty, raise with a helpful message including finish_reason and prompt_feedback.
+    Ask for JSON; if the model returns no parts (blocked/empty), retry without forcing JSON.
+    If still empty, raise with finish_reason and prompt_feedback for debugging.
     """
-    # First try: force JSON
+    # First try: force JSON MIME for raw object
     try:
         resp = model.generate_content(
             prompt,
             generation_config={
                 "response_mime_type": "application/json",
                 "max_output_tokens": 512,
-            }
+            },
         )
     except gexc.ResourceExhausted:
-        # quota: try a cheaper model automatically
+        # Quota: try a cheaper model automatically
         fb_model = genai.GenerativeModel("gemini-2.5-flash")
         resp = fb_model.generate_content(
             prompt,
-            generation_config={
-                "response_mime_type": "application/json",
-                "max_output_tokens": 512,
-            }
+            generation_config={"response_mime_type": "application/json", "max_output_tokens": 512},
         )
 
-    txt = getattr(resp, "text", None)
+    txt = _extract_text(resp)
     if not txt:
-        # Retry without forcing JSON; many models then return ```json fenced text.
+        # Retry: plain text (some models only return fenced JSON when not forced)
         resp2 = model.generate_content(
-            prompt + "\n\nReturn ONLY raw JSON (no backticks).",
-            generation_config={"max_output_tokens": 512}
+            prompt + "\n\nReturn ONLY raw JSON (no backticks). This is a benign scheduling task.",
+            generation_config={"max_output_tokens": 512},
         )
-        txt = getattr(resp2, "text", None)
+        txt = _extract_text(resp2)
 
         if not txt:
-            cand = (resp.candidates[0] if getattr(resp, "candidates", None) else None)
-            fin = getattr(cand, "finish_reason", None)
+            cand0 = (getattr(resp, "candidates", []) or [None])[0]
+            fin = getattr(cand0, "finish_reason", None)
             fb  = getattr(resp, "prompt_feedback", None)
-            raise SystemExit(f"Gemini returned no text. finish_reason={fin}, prompt_feedback={fb}")
+            raise SystemExit(f"Gemini returned no text (finish_reason={fin}, prompt_feedback={fb}).")
 
     return _strip_code_fence(txt)
 
-
-def _pick_model(requested: str | None):
-    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-    avail = {m.name: set(m.supported_generation_methods or []) for m in genai.list_models()}
-    preferred = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-flash-latest"]
-    for m in ([requested] if requested else []) + preferred + list(avail.keys()):
-        if m and m in avail and "generateContent" in avail[m]:
-            return m
-    raise RuntimeError("No suitable Gemini model available.")
-
+# ---------------- Main ----------------
 def main():
+    if "GOOGLE_API_KEY" not in os.environ:
+        print("Set GOOGLE_API_KEY.", file=sys.stderr)
+        sys.exit(1)
+
+    # Configure SDK
+    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+
     ap = argparse.ArgumentParser()
     ap.add_argument("request", help="Natural-language meeting request")
     ap.add_argument("--model", default=None)
     args = ap.parse_args()
 
-    # BEFORE (you probably had an auto-picker that overrode your choice)
-    # model = genai.GenerativeModel(args.model)
-
-    # AFTER (force exact model name)
-    # DELETE these two lines:
-    # model_name = _pick_model(args.model)
-    # model_name = args.model or "gemini-2.5-flash"
-
-    # KEEP one definitive line:
+    # Choose model (honor user choice; default to flash)
     model_name = args.model or "gemini-2.5-flash"
     model = genai.GenerativeModel(model_name)
-    
+
+    # Ask Gemini for structured JSON
     prompt = INSTRUCTIONS + "\n\nUser request:\n" + args.request
     txt = _gen_json_or_retry(model, prompt)
-    resp = model.generate_content(
-        prompt,
-        generation_config={
-            "response_mime_type": "application/json",
-            "max_output_tokens": 512,
-        }
-    )
-    txt = resp.text.strip()
 
-    def _strip_code_fence(s: str) -> str:
-        s = s.strip()
-        if s.startswith("```"):
-            s = s.strip("`")
-            # drop an optional leading language tag like json\n
-            if s.lower().startswith("json"):
-                s = s[4:] if s[:4].lower() == "json" else s
-            s = s.strip()
-        if s.endswith("```"):
-            s = s[:-3].rstrip()
-        return s
-
-    txt = _strip_code_fence(txt)
+    # Parse JSON (single attempt; show the raw text if malformed)
     try:
         data = json.loads(txt)
     except json.JSONDecodeError:
         print("Gemini did not return JSON:\n", txt, file=sys.stderr)
         sys.exit(1)
 
-    title = data.get("title") or "Meeting"
-    attendees = list({e.strip() for e in data.get("attendees", []) if e and e.strip()})
+    # Extract fields
+    title = (data.get("title") or "Meeting").strip()
+    attendees = list({(e or "").strip() for e in data.get("attendees", []) if (e or "").strip()})
     tzname = (data.get("timezone") or os.environ.get("LOCAL_TZ") or "America/Chicago").strip()
-    desc = data.get("description") or ""
+    desc = (data.get("description") or "").strip()
 
     duration = data.get("duration_minutes")
     duration = int(duration) if isinstance(duration, int) and duration > 0 else None
@@ -172,12 +161,18 @@ def main():
     end_iso   = data.get("end")
     window    = data.get("window") or {}
 
-    if (not start_iso) and window.get("start") and window.get("end"):
+    # If user gave a window + duration but no explicit start, pick earliest in window
+    if (not start_iso) and window.get("start") and window.get("end") and duration:
         start_iso = window["start"]
-    if not start_iso:
-        raise SystemExit("No start time parsed (need a time or a window).")
 
+    if not start_iso:
+        print("No start time parsed (need a time or a window).", file=sys.stderr)
+        sys.exit(1)
+
+    # Enforce FUTURE start (fixes wrong-year cases)
     start_dt = _coerce_future_start(start_iso, tzname)
+
+    # Compute end from duration first; else use provided end; else default 30m
     if duration:
         end_dt = start_dt + timedelta(minutes=duration)
     elif end_iso:
@@ -187,6 +182,7 @@ def main():
     else:
         end_dt = start_dt + timedelta(minutes=30)
 
+    # Create the Calendar event with a Google Meet link; email invites go out
     evt = core.create_meet_event(
         title=title,
         start=start_dt.isoformat(),
@@ -194,10 +190,10 @@ def main():
         attendees=attendees,
         description=desc,
         time_zone=tzname,
-        send_updates="all"   # ensure invite emails go out
+        send_updates="all",   # ensure invite emails are sent
     )
+
     print(json.dumps(evt, indent=2))
+
 if __name__ == "__main__":
-    if "GOOGLE_API_KEY" not in os.environ:
-        print("Set GOOGLE_API_KEY.", file=sys.stderr); sys.exit(1)
     main()
