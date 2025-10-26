@@ -132,8 +132,14 @@ async def main():
     server_script = sys.argv[1]
     params = StdioServerParameters(command="python", args=[server_script])
 
-    # Gemini client (reads GEMINI_API_KEY from env)
-    ai = genai.Client()
+    # Gemini client (reads GOOGLE_API_KEY from env)
+    api_key = os.getenv("AIzaSyCTnv7TT6uQB_IYrJOeJkruIkHEFjuiK7A")
+    if not api_key:
+        raise ValueError(
+            "Set GOOGLE_API_KEY in your environment (or pass api_key to genai.Client)."
+        )
+    ai = genai.Client(api_key=api_key)
+
 
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
